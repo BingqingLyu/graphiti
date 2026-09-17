@@ -26,6 +26,12 @@ from pydantic import BaseModel, Field
 from typing_extensions import LiteralString
 
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
+from graphiti_core.driver.neug.dialect import neug_limit
+from graphiti_core.driver.neug.edge_mirror import (
+    NEUG_EDGE_DOC_DELETE,
+    NEUG_EDGE_DOC_UPSERT,
+    edge_doc_upsert_params,
+)
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError
 from graphiti_core.helpers import parse_db_date
@@ -86,6 +92,9 @@ class Edge(BaseModel, ABC):
                 """,
                 uuid=self.uuid,
             )
+            if driver.provider == GraphProvider.NEUG:
+                # RELATES_TO edges carry an EdgeDoc mirror; remove it too.
+                await driver.execute_query(NEUG_EDGE_DOC_DELETE, uuid=self.uuid)
 
         logger.debug(f'Deleted Edge: {self.uuid}')
 
@@ -117,14 +126,35 @@ class Edge(BaseModel, ABC):
                 uuids=uuids,
             )
         else:
-            await driver.execute_query(
-                """
-                MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER]->(m)
-                WHERE e.uuid IN $uuids
-                DELETE e
-                """,
-                uuids=uuids,
-            )
+            if driver.provider == GraphProvider.NEUG:
+                if not uuids:
+                    return
+                await driver.execute_query(
+                    """
+                    MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER]->(m)
+                    WHERE e.uuid IN $uuids
+                    DELETE e
+                    """,
+                    uuids=uuids,
+                )
+                # RELATES_TO edges carry EdgeDoc mirrors; remove them too.
+                await driver.execute_query(
+                    """
+                    MATCH (d:EdgeDoc)
+                    WHERE d.uuid IN $uuids
+                    DETACH DELETE d
+                    """,
+                    uuids=uuids,
+                )
+            else:
+                await driver.execute_query(
+                    """
+                    MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER]->(m)
+                    WHERE e.uuid IN $uuids
+                    DELETE e
+                    """,
+                    uuids=uuids,
+                )
 
         logger.debug(f'Deleted Edges: {uuids}')
 
@@ -197,10 +227,14 @@ class EpisodicEdge(Edge):
             except NotImplementedError:
                 pass
 
+        uuids_filter = 'e.uuid IN $uuids'
+
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Episodic)-[e:MENTIONS]->(m:Entity)
-            WHERE e.uuid IN $uuids
+            WHERE """
+            + uuids_filter
+            + """
             RETURN
             """
             + EPISODIC_EDGE_RETURN,
@@ -230,14 +264,21 @@ class EpisodicEdge(Edge):
             except NotImplementedError:
                 pass
 
-        cursor_query: LiteralString = 'AND e.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+        cursor_query = 'AND e.uuid < $uuid' if uuid_cursor else ''
+        group_ids_filter = 'e.group_id IN $group_ids'
+        # NeuG only accepts literal LIMITs.
+        limit_query = (
+            neug_limit(limit)
+            if driver.provider == GraphProvider.NEUG
+            else ('LIMIT $limit' if limit is not None else '')
+        )
 
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Episodic)-[e:MENTIONS]->(m:Entity)
-            WHERE e.group_id IN $group_ids
-            """
+            WHERE """
+            + group_ids_filter
+            + '\n'
             + cursor_query
             + """
             RETURN
@@ -355,12 +396,40 @@ class EntityEdge(Edge):
             'reference_time': self.reference_time,
         }
 
-        if driver.provider == GraphProvider.KUZU:
+        if driver.provider in (GraphProvider.KUZU, GraphProvider.NEUG):
+            # NEUG/KUZU save queries bind flat $params (nested map binding is
+            # unsupported on NeuG); attributes are JSON-serialized into their
+            # STRING column.
             edge_data['attributes'] = json.dumps(self.attributes)
             result = await driver.execute_query(
                 get_entity_edge_save_query(driver.provider),
                 **edge_data,
             )
+            if driver.provider == GraphProvider.NEUG:
+                # Keep the EdgeDoc mirror (edge-level retrieval index) in sync
+                # with the single-edge save path; the bulk path maintains it
+                # on its own.
+                await driver.execute_query(
+                    NEUG_EDGE_DOC_UPSERT,
+                    **edge_doc_upsert_params(
+                        {
+                            'uuid': self.uuid,
+                            'source_node_uuid': self.source_node_uuid,
+                            'target_node_uuid': self.target_node_uuid,
+                            'group_id': self.group_id,
+                            'name': self.name,
+                            'fact': self.fact,
+                            'fact_embedding': self.fact_embedding,
+                            'episodes': self.episodes,
+                            'attributes': json.dumps(self.attributes),
+                            'created_at': self.created_at,
+                            'expired_at': self.expired_at,
+                            'valid_at': self.valid_at,
+                            'invalid_at': self.invalid_at,
+                            'reference_time': self.reference_time,
+                        }
+                    ),
+                )
         else:
             for k, v in (self.attributes or {}).items():
                 if k not in edge_data:
@@ -462,10 +531,14 @@ class EntityEdge(Edge):
                 MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(m:Entity)
             """
 
+        uuids_filter = 'e.uuid IN $uuids'
+
         records, _, _ = await driver.execute_query(
             match_query
             + """
-            WHERE e.uuid IN $uuids
+            WHERE """
+            + uuids_filter
+            + """
             RETURN
             """
             + get_entity_edge_return_query(driver.provider),
@@ -494,8 +567,14 @@ class EntityEdge(Edge):
             except NotImplementedError:
                 pass
 
-        cursor_query: LiteralString = 'AND e.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+        cursor_query = 'AND e.uuid < $uuid' if uuid_cursor else ''
+        group_ids_filter = 'e.group_id IN $group_ids'
+        # NeuG only accepts literal LIMITs.
+        limit_query = (
+            neug_limit(limit)
+            if driver.provider == GraphProvider.NEUG
+            else ('LIMIT $limit' if limit is not None else '')
+        )
         with_embeddings_query: LiteralString = (
             """,
                 e.fact_embedding AS fact_embedding
@@ -515,8 +594,9 @@ class EntityEdge(Edge):
         records, _, _ = await driver.execute_query(
             match_query
             + """
-            WHERE e.group_id IN $group_ids
-            """
+            WHERE """
+            + group_ids_filter
+            + '\n'
             + cursor_query
             + """
             RETURN
@@ -556,6 +636,22 @@ class EntityEdge(Edge):
             match_query = """
                 MATCH (n:Entity {uuid: $node_uuid})-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(m:Entity)
             """
+        if driver.provider == GraphProvider.NEUG:
+            # NeuG names the endpoint functions START_NODE()/END_NODE() and
+            # does not allow extracting properties from them directly, so
+            # they are bound in a WITH layer; the undirected match then
+            # always binds n to the source and m to the target.
+            records, _, _ = await driver.execute_query(
+                """
+                MATCH (x:Entity {uuid: $node_uuid})-[e:RELATES_TO]-()
+                WITH e, START_NODE(e) AS n, END_NODE(e) AS m
+                RETURN
+                """
+                + get_entity_edge_return_query(driver.provider),
+                node_uuid=node_uuid,
+                routing_='r',
+            )
+            return [get_entity_edge_from_record(record, driver.provider) for record in records]
 
         records, _, _ = await driver.execute_query(
             match_query
@@ -627,10 +723,14 @@ class CommunityEdge(Edge):
             except NotImplementedError:
                 pass
 
+        uuids_filter = 'e.uuid IN $uuids'
+
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Community)-[e:HAS_MEMBER]->(m)
-            WHERE e.uuid IN $uuids
+            WHERE """
+            + uuids_filter
+            + """
             RETURN
             """
             + COMMUNITY_EDGE_RETURN,
@@ -658,14 +758,21 @@ class CommunityEdge(Edge):
             except NotImplementedError:
                 pass
 
-        cursor_query: LiteralString = 'AND e.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+        cursor_query = 'AND e.uuid < $uuid' if uuid_cursor else ''
+        group_ids_filter = 'e.group_id IN $group_ids'
+        # NeuG only accepts literal LIMITs.
+        limit_query = (
+            neug_limit(limit)
+            if driver.provider == GraphProvider.NEUG
+            else ('LIMIT $limit' if limit is not None else '')
+        )
 
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Community)-[e:HAS_MEMBER]->(m)
-            WHERE e.group_id IN $group_ids
-            """
+            WHERE """
+            + group_ids_filter
+            + '\n'
             + cursor_query
             + """
             RETURN
@@ -760,10 +867,14 @@ class HasEpisodeEdge(Edge):
             except NotImplementedError:
                 pass
 
+        uuids_filter = 'e.uuid IN $uuids'
+
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Saga)-[e:HAS_EPISODE]->(m:Episodic)
-            WHERE e.uuid IN $uuids
+            WHERE """
+            + uuids_filter
+            + """
             RETURN
             """
             + HAS_EPISODE_EDGE_RETURN,
@@ -791,14 +902,21 @@ class HasEpisodeEdge(Edge):
             except NotImplementedError:
                 pass
 
-        cursor_query: LiteralString = 'AND e.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+        cursor_query = 'AND e.uuid < $uuid' if uuid_cursor else ''
+        group_ids_filter = 'e.group_id IN $group_ids'
+        # NeuG only accepts literal LIMITs.
+        limit_query = (
+            neug_limit(limit)
+            if driver.provider == GraphProvider.NEUG
+            else ('LIMIT $limit' if limit is not None else '')
+        )
 
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Saga)-[e:HAS_EPISODE]->(m:Episodic)
-            WHERE e.group_id IN $group_ids
-            """
+            WHERE """
+            + group_ids_filter
+            + '\n'
             + cursor_query
             + """
             RETURN
@@ -895,10 +1013,14 @@ class NextEpisodeEdge(Edge):
             except NotImplementedError:
                 pass
 
+        uuids_filter = 'e.uuid IN $uuids'
+
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Episodic)-[e:NEXT_EPISODE]->(m:Episodic)
-            WHERE e.uuid IN $uuids
+            WHERE """
+            + uuids_filter
+            + """
             RETURN
             """
             + NEXT_EPISODE_EDGE_RETURN,
@@ -926,14 +1048,21 @@ class NextEpisodeEdge(Edge):
             except NotImplementedError:
                 pass
 
-        cursor_query: LiteralString = 'AND e.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+        cursor_query = 'AND e.uuid < $uuid' if uuid_cursor else ''
+        group_ids_filter = 'e.group_id IN $group_ids'
+        # NeuG only accepts literal LIMITs.
+        limit_query = (
+            neug_limit(limit)
+            if driver.provider == GraphProvider.NEUG
+            else ('LIMIT $limit' if limit is not None else '')
+        )
 
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Episodic)-[e:NEXT_EPISODE]->(m:Episodic)
-            WHERE e.group_id IN $group_ids
-            """
+            WHERE """
+            + group_ids_filter
+            + '\n'
             + cursor_query
             + """
             RETURN
@@ -967,7 +1096,8 @@ def get_episodic_edge_from_record(record: Any) -> EpisodicEdge:
 
 def get_entity_edge_from_record(record: Any, provider: GraphProvider) -> EntityEdge:
     episodes = record['episodes']
-    if provider == GraphProvider.KUZU:
+    if provider in (GraphProvider.KUZU, GraphProvider.NEUG):
+        # attributes are stored JSON-serialized in a STRING column
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
     else:
         attributes = record['attributes']

@@ -21,6 +21,7 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.driver.neug.dialect import esc, iso, neug_in_filter
 from graphiti_core.helpers import validate_node_labels
 
 
@@ -96,6 +97,12 @@ def node_search_filter_query_constructor(
         if provider == GraphProvider.KUZU:
             node_label_filter = 'list_has_all(n.labels, $labels)'
             filter_params['labels'] = filters.node_labels
+        elif provider == GraphProvider.NEUG:
+            # labels is a STRING[] column; bound list params are unusable, so
+            # chain one list_contains() call per label with inlined literals.
+            node_label_filter = ' AND '.join(
+                f'list_contains(n.labels, {esc(label)})' for label in filters.node_labels
+            )
         else:
             node_labels = '|'.join(filters.node_labels)
             node_label_filter = 'n:' + node_labels
@@ -117,23 +124,83 @@ def date_filter_query_constructor(
     return query
 
 
+def date_filter_query_constructor_neug(
+    value_name: str, param_name: str, operator: ComparisonOperator
+) -> str:
+    # NeuG stores unset STRING columns as '' rather than NULL, so null checks
+    # become empty-string comparisons.
+    query = '(' + value_name + ' '
+
+    if operator == ComparisonOperator.is_null:
+        query += "= '')"
+    elif operator == ComparisonOperator.is_not_null:
+        query += "<> '')"
+    else:
+        query += operator.value + ' ' + param_name + ')'
+
+    return query
+
+
+def neug_node_label_filter(labels: list[str]) -> str:
+    """AND-chain list_contains() over both endpoints' labels (NEUG).
+
+    ``labels`` is a STRING[] column and bound list params are unusable for it,
+    so each label is inlined as a literal. The query must bind ``n`` and ``m``
+    to the source/target Entity nodes (only reachable via a join, since the
+    EdgeDoc mirror carries no label columns).
+    """
+    return ' AND '.join(
+        f'list_contains(n.labels, {esc(label)}) AND list_contains(m.labels, {esc(label)})'
+        for label in labels
+    )
+
+
 def edge_search_filter_query_constructor(
     filters: SearchFilters,
     provider: GraphProvider,
+    edge_alias: str = 'e',
+    emit_node_labels: bool = True,
 ) -> tuple[list[str], dict[str, Any]]:
+    """Edge filters. ``edge_alias`` retargets every edge-column predicate (the
+    NEUG EdgeDoc-mirror path passes ``d``); ``emit_node_labels=False`` drops the
+    node_labels predicate, which needs n/m and so cannot ride an EdgeDoc-only
+    prefilter (the caller joins for it separately).
+    """
     filter_queries: list[str] = []
     filter_params: dict[str, Any] = {}
 
+    if provider == GraphProvider.NEUG:
+        date_constructor = date_filter_query_constructor_neug
+    else:
+        date_constructor = date_filter_query_constructor
+
+    def date_param_value(date_filter: DateFilter) -> Any:
+        # NeuG stores datetimes as fixed-width ISO-8601 strings, so filter
+        # values must be serialized to match.
+        if provider == GraphProvider.NEUG:
+            return iso(date_filter.date)
+        return date_filter.date
+
     if filters.edge_types is not None:
-        edge_types = filters.edge_types
-        filter_queries.append('e.name in $edge_types')
-        filter_params['edge_types'] = edge_types
+        if provider == GraphProvider.NEUG:
+            filter_queries.append(
+                neug_in_filter(f'{edge_alias}.name', filters.edge_types, filter_params)
+            )
+        else:
+            edge_types = filters.edge_types
+            filter_queries.append(f'{edge_alias}.name in $edge_types')
+            filter_params['edge_types'] = edge_types
 
     if filters.edge_uuids is not None:
-        filter_queries.append('e.uuid in $edge_uuids')
-        filter_params['edge_uuids'] = filters.edge_uuids
+        if provider == GraphProvider.NEUG:
+            filter_queries.append(
+                neug_in_filter(f'{edge_alias}.uuid', filters.edge_uuids, filter_params)
+            )
+        else:
+            filter_queries.append(f'{edge_alias}.uuid in $edge_uuids')
+            filter_params['edge_uuids'] = filters.edge_uuids
 
-    if filters.node_labels is not None:
+    if filters.node_labels is not None and emit_node_labels:
         # Defense-in-depth for model_construct()/other validation bypasses.
         validate_node_labels(filters.node_labels)
         if provider == GraphProvider.KUZU:
@@ -141,6 +208,8 @@ def edge_search_filter_query_constructor(
                 'list_has_all(n.labels, $labels) AND list_has_all(m.labels, $labels)'
             )
             filter_params['labels'] = filters.node_labels
+        elif provider == GraphProvider.NEUG:
+            node_label_filter = neug_node_label_filter(filters.node_labels)
         else:
             node_labels = '|'.join(filters.node_labels)
             node_label_filter = 'n:' + node_labels + ' AND m:' + node_labels
@@ -154,11 +223,11 @@ def edge_search_filter_query_constructor(
                     ComparisonOperator.is_null,
                     ComparisonOperator.is_not_null,
                 ]:
-                    filter_params['valid_at_' + str(j)] = date_filter.date
+                    filter_params['valid_at_' + str(j)] = date_param_value(date_filter)
 
             and_filters = [
-                date_filter_query_constructor(
-                    'e.valid_at', f'$valid_at_{j}', date_filter.comparison_operator
+                date_constructor(
+                    f'{edge_alias}.valid_at', f'$valid_at_{j}', date_filter.comparison_operator
                 )
                 for j, date_filter in enumerate(or_list)
             ]
@@ -185,11 +254,11 @@ def edge_search_filter_query_constructor(
                     ComparisonOperator.is_null,
                     ComparisonOperator.is_not_null,
                 ]:
-                    filter_params['invalid_at_' + str(j)] = date_filter.date
+                    filter_params['invalid_at_' + str(j)] = date_param_value(date_filter)
 
             and_filters = [
-                date_filter_query_constructor(
-                    'e.invalid_at', f'$invalid_at_{j}', date_filter.comparison_operator
+                date_constructor(
+                    f'{edge_alias}.invalid_at', f'$invalid_at_{j}', date_filter.comparison_operator
                 )
                 for j, date_filter in enumerate(or_list)
             ]
@@ -216,11 +285,11 @@ def edge_search_filter_query_constructor(
                     ComparisonOperator.is_null,
                     ComparisonOperator.is_not_null,
                 ]:
-                    filter_params['created_at_' + str(j)] = date_filter.date
+                    filter_params['created_at_' + str(j)] = date_param_value(date_filter)
 
             and_filters = [
-                date_filter_query_constructor(
-                    'e.created_at', f'$created_at_{j}', date_filter.comparison_operator
+                date_constructor(
+                    f'{edge_alias}.created_at', f'$created_at_{j}', date_filter.comparison_operator
                 )
                 for j, date_filter in enumerate(or_list)
             ]
@@ -247,11 +316,11 @@ def edge_search_filter_query_constructor(
                     ComparisonOperator.is_null,
                     ComparisonOperator.is_not_null,
                 ]:
-                    filter_params['expired_at_' + str(j)] = date_filter.date
+                    filter_params['expired_at_' + str(j)] = date_param_value(date_filter)
 
             and_filters = [
-                date_filter_query_constructor(
-                    'e.expired_at', f'$expired_at_{j}', date_filter.comparison_operator
+                date_constructor(
+                    f'{edge_alias}.expired_at', f'$expired_at_{j}', date_filter.comparison_operator
                 )
                 for j, date_filter in enumerate(or_list)
             ]

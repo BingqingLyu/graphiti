@@ -27,6 +27,7 @@ from graphiti_core.driver.driver import (
     GraphDriver,
     GraphProvider,
 )
+from graphiti_core.driver.neug.dialect import build_fts_query
 from graphiti_core.edges import EntityEdge, get_entity_edge_from_record
 from graphiti_core.graph_queries import (
     get_nodes_query,
@@ -39,7 +40,10 @@ from graphiti_core.helpers import (
     semaphore_gather,
     validate_group_ids,
 )
-from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
+from graphiti_core.models.edges.edge_db_queries import (
+    get_entity_edge_doc_return_query,
+    get_entity_edge_return_query,
+)
 from graphiti_core.models.nodes.node_db_queries import (
     COMMUNITY_NODE_RETURN,
     EPISODIC_NODE_RETURN,
@@ -56,6 +60,7 @@ from graphiti_core.nodes import (
 from graphiti_core.search.search_filters import (
     SearchFilters,
     edge_search_filter_query_constructor,
+    neug_node_label_filter,
     node_search_filter_query_constructor,
 )
 
@@ -92,6 +97,10 @@ def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver)
         return query
     elif driver.provider == GraphProvider.FALKORDB:
         return driver.build_fulltext_query(query, group_ids, MAX_QUERY_LENGTH)
+    elif driver.provider == GraphProvider.NEUG:
+        # NeuG's bm25() takes a plain term query; group filtering is applied
+        # separately on the matched rows.
+        return build_fts_query(query)
     group_ids_filter_list = (
         [driver.fulltext_syntax + f'group_id:"{g}"' for g in group_ids]
         if group_ids is not None
@@ -139,6 +148,9 @@ async def get_mentioned_nodes(
 
     episode_uuids = [episode.uuid for episode in episodes]
 
+    if len(episode_uuids) == 0:
+        return []
+
     records, _, _ = await driver.execute_query(
         """
         MATCH (episode:Episodic)-[:MENTIONS]->(n:Entity)
@@ -165,6 +177,9 @@ async def get_communities_by_nodes(
             pass
 
     node_uuids = [node.uuid for node in nodes]
+
+    if len(node_uuids) == 0:
+        return []
 
     records, _, _ = await driver.execute_query(
         """
@@ -232,6 +247,78 @@ async def edge_fulltext_search(
     filter_query = ''
     if filter_queries:
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
+
+    if driver.provider == GraphProvider.NEUG:
+        # Rank on the EdgeDoc mirror's FTS index with bm25() (negative scores,
+        # ascending = more relevant) and project the edge straight from
+        # EdgeDoc, which carries every returned field plus both endpoint uuids,
+        # so the join back to RELATES_TO is dropped and the FTS IndexScan is
+        # kept. Every EdgeDoc-column filter (group, edge name/uuid, temporal)
+        # rides the PRE-bm25 WHERE, so the top-K is computed within the
+        # filtered set (exact recall); the old shape filtered AFTER the LIMIT.
+        doc_filters, doc_params = edge_search_filter_query_constructor(
+            search_filter, driver.provider, edge_alias='d', emit_node_labels=False
+        )
+        if group_ids is not None:
+            doc_filters.append('d.group_id IN $group_ids')
+            doc_params['group_ids'] = group_ids
+        doc_prefilter = (' WHERE ' + ' AND '.join(doc_filters)) if doc_filters else ''
+
+        if search_filter.node_labels:
+            # node_labels is the one filter EdgeDoc cannot serve (no label
+            # columns), so join to the endpoints and rank after the join. The
+            # join runs BEFORE the top-K, so recall stays exact (bm25 still
+            # resolves through the EdgeDoc FTS index).
+            query = (
+                """
+                MATCH (d:EdgeDoc)
+                """
+                + doc_prefilter
+                + """
+                MATCH (n:Entity)-[e:RELATES_TO {uuid: d.uuid}]->(m:Entity)
+                WHERE """
+                + neug_node_label_filter(search_filter.node_labels)
+                + """
+                WITH d, n, m, e, bm25(d.fact, $query) AS score
+                ORDER BY score ASC LIMIT """
+                + str(int(limit))
+                + """
+                RETURN
+                """
+                + get_entity_edge_return_query(driver.provider)
+                + """, score
+                ORDER BY score ASC
+                """
+            )
+        else:
+            query = (
+                """
+                MATCH (d:EdgeDoc)
+                """
+                + doc_prefilter
+                + """
+                WITH d, bm25(d.fact, $query) AS score
+                ORDER BY score ASC LIMIT """
+                + str(int(limit))
+                + """
+                RETURN
+                """
+                + get_entity_edge_doc_return_query()
+                + """, score
+                ORDER BY score ASC
+                """
+            )
+
+        records, _, _ = await driver.execute_query(
+            query,
+            query=fuzzy_query,
+            routing_='r',
+            **doc_params,
+        )
+
+        edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
+
+        return edges
 
     if driver.provider == GraphProvider.NEPTUNE:
         res = driver.run_aoss_query('edge_name_and_fact', query)  # pyright: ignore reportAttributeAccessIssue
@@ -352,6 +439,94 @@ async def edge_similarity_search(
     search_vector_var = '$search_vector'
     if driver.provider == GraphProvider.KUZU:
         search_vector_var = f'CAST($search_vector AS FLOAT[{len(search_vector)}])'
+
+    if driver.provider == GraphProvider.NEUG:
+        # Rank over the EdgeDoc mirror and project the edge straight from it.
+        # EdgeDoc carries every returned field plus both endpoint uuids, so the
+        # join back to RELATES_TO is dropped: keeping vector_distance in the
+        # TERMINAL `RETURN ... ORDER BY dist ASC LIMIT k` (no intervening WITH,
+        # no join) is what lets the engine rewrite it into an HNSW IndexScan
+        # with the WHERE pushed down as a scalar pre-filter. Measured at 20k
+        # edges / 128-dim: ~1ms and exact top-K, vs ~46ms brute-force with
+        # rows=3 for the old double-WITH + post-LIMIT-join shape — there the
+        # group filter ran AFTER the global top-K, so most of the K rows were
+        # discarded (both a perf and a recall bug). Every EdgeDoc-column filter
+        # (group, endpoints, edge name/uuid, temporal) rides the pre-RETURN
+        # WHERE, so the top-K is computed within the filtered set. min_score
+        # trims the ranked top-K client-side (monotone in dist), matching
+        # node_similarity_search. The query vector rides a bound
+        # $search_vector; see node_similarity_search for why inlining it costs
+        # ~92% of the query's latency in plan recompilation.
+        doc_filters, doc_params = edge_search_filter_query_constructor(
+            search_filter, driver.provider, edge_alias='d', emit_node_labels=False
+        )
+        if group_ids is not None:
+            doc_filters.append('d.group_id IN $group_ids')
+            doc_params['group_ids'] = group_ids
+            if source_node_uuid is not None:
+                doc_params['source_uuid'] = source_node_uuid
+                doc_filters.append('d.source_node_uuid = $source_uuid')
+            if target_node_uuid is not None:
+                doc_params['target_uuid'] = target_node_uuid
+                doc_filters.append('d.target_node_uuid = $target_uuid')
+        doc_prefilter = (' WHERE ' + ' AND '.join(doc_filters)) if doc_filters else ''
+
+        if search_filter.node_labels:
+            # node_labels is the one filter EdgeDoc cannot serve (no label
+            # columns), so join to the endpoints and rank after the join. The
+            # join defeats the HNSW rewrite (brute-force re-rank), but it runs
+            # BEFORE the top-K, so recall stays exact.
+            query = (
+                """
+                MATCH (d:EdgeDoc)
+                """
+                + doc_prefilter
+                + """
+                MATCH (n:Entity)-[e:RELATES_TO {uuid: d.uuid}]->(m:Entity)
+                WHERE """
+                + neug_node_label_filter(search_filter.node_labels)
+                + """
+                WITH d, n, m, e, vector_distance_cosine(d.fact_embedding, $search_vector) AS dist
+                ORDER BY dist ASC LIMIT """
+                + str(int(limit))
+                + """
+                RETURN
+                """
+                + get_entity_edge_return_query(driver.provider)
+                + """, dist
+                ORDER BY dist ASC
+                """
+            )
+        else:
+            query = (
+                """
+                MATCH (d:EdgeDoc)
+                """
+                + doc_prefilter
+                + """
+                RETURN
+                """
+                + get_entity_edge_doc_return_query()
+                + """,
+                vector_distance_cosine(d.fact_embedding, $search_vector) AS dist
+                ORDER BY dist ASC LIMIT """
+                + str(int(limit))
+            )
+
+        records, _, _ = await driver.execute_query(
+            query,
+            search_vector=search_vector,
+            routing_='r',
+            **doc_params,
+        )
+
+        edges = [
+            get_entity_edge_from_record(record, driver.provider)
+            for record in records
+            if (1.0 - float(record['dist'])) > min_score
+        ]
+
+        return edges
 
     if driver.provider == GraphProvider.NEPTUNE:
         query = (
@@ -479,6 +654,61 @@ async def edge_bfs_search(
     if filter_queries:
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
+    if driver.provider == GraphProvider.NEUG:
+        # No UNWIND and no mixed-type traversal from an unlabelled origin, so
+        # BFS runs as one leg per origin kind. An edge is within `depth` hops
+        # iff its source node is reachable in <= depth - 1 hops; MENTIONS only
+        # ever appears as the first hop out of an Episodic origin.
+        if bfs_max_depth < 1:
+            return []
+
+        filter_params['bfs_origin_node_uuids'] = bfs_origin_node_uuids
+        # Each NEUG leg already carries a WHERE clause, so extra filters join
+        # on with AND rather than introducing a second WHERE.
+        neug_filter_query = ''
+        if filter_queries:
+            neug_filter_query = ' AND ' + (' AND '.join(filter_queries))
+
+        match_queries = [
+            f"""
+            MATCH (origin:Entity)-[:RELATES_TO*0..{bfs_max_depth - 1}]->(n:Entity)-[e:RELATES_TO]->(m:Entity)
+            WHERE origin.uuid IN $bfs_origin_node_uuids
+            """,
+        ]
+        if bfs_max_depth >= 2:
+            if bfs_max_depth == 2:
+                episodic_leg = """
+                MATCH (origin:Episodic)-[:MENTIONS]->(n:Entity)-[e:RELATES_TO]->(m:Entity)
+                WHERE origin.uuid IN $bfs_origin_node_uuids
+                """
+            else:
+                episodic_leg = f"""
+                MATCH (origin:Episodic)-[:MENTIONS]->(:Entity)-[:RELATES_TO*0..{bfs_max_depth - 2}]->(n:Entity)-[e:RELATES_TO]->(m:Entity)
+                WHERE origin.uuid IN $bfs_origin_node_uuids
+                """
+            match_queries.append(episodic_leg)
+
+        records = []
+        for match_query in match_queries:
+            sub_records, _, _ = await driver.execute_query(
+                match_query
+                + neug_filter_query
+                + """
+                RETURN DISTINCT
+                """
+                + get_entity_edge_return_query(driver.provider)
+                + """
+                LIMIT """
+                + str(int(limit)),
+                routing_='r',
+                **filter_params,
+            )
+            records.extend(sub_records)
+
+        edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
+
+        return edges
+
     if driver.provider == GraphProvider.KUZU:
         # Kuzu stores entity edges twice with an intermediate node, so we need to match them
         # separately for the correct BFS depth.
@@ -600,11 +830,30 @@ async def node_fulltext_search(
     if filter_queries:
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
-    yield_query = 'YIELD node AS n, score'
-    if driver.provider == GraphProvider.KUZU:
-        yield_query = 'WITH node AS n, score'
-
-    if driver.provider == GraphProvider.NEPTUNE:
+    if driver.provider == GraphProvider.NEUG:
+        # Single weighted multi-property bm25 over the Entity(name, summary)
+        # FTS index (name weighted 3x summary). group/label filters ride the
+        # PRE-bm25 WHERE, so the top-K is computed within the filtered set
+        # (exact recall). Replaces two per-column queries merged client-side,
+        # which also ran the filter AFTER ORDER BY/LIMIT (a recall bug).
+        records, _, _ = await driver.execute_query(
+            """
+            MATCH (n:Entity)
+            """
+            + filter_query
+            + """
+            WITH n, bm25([n.name, n.summary], [3.0, 1.0], $query) AS score
+            ORDER BY score ASC LIMIT """
+            + str(int(limit))
+            + """
+            RETURN
+            """
+            + get_entity_node_return_query(driver.provider),
+            query=fuzzy_query,
+            routing_='r',
+            **filter_params,
+        )
+    elif driver.provider == GraphProvider.NEPTUNE:
         res = driver.run_aoss_query('node_name_and_summary', query, limit=limit)  # pyright: ignore reportAttributeAccessIssue
         if res['hits']['total']['value'] > 0:
             input_ids = []
@@ -636,6 +885,10 @@ async def node_fulltext_search(
         else:
             return []
     else:
+        yield_query = 'YIELD node AS n, score'
+        if driver.provider == GraphProvider.KUZU:
+            yield_query = 'WITH node AS n, score'
+
         query = (
             get_nodes_query(
                 'node_name_and_summary', '$query', limit=limit, provider=driver.provider
@@ -692,6 +945,59 @@ async def node_similarity_search(
     search_vector_var = '$search_vector'
     if driver.provider == GraphProvider.KUZU:
         search_vector_var = f'CAST($search_vector AS FLOAT[{len(search_vector)}])'
+
+    if driver.provider == GraphProvider.NEUG:
+        # HNSW ANN path. The engine rewrites a terminal
+        #   RETURN ..., vector_distance_cosine(n.name_embedding, $q) AS dist
+        #   ORDER BY dist ASC LIMIT k
+        # into an ANN IndexScan. Any extra `WITH n, dist` projection, or a WHERE
+        # placed after ORDER BY/LIMIT, defeats that rewrite and degrades to a
+        # brute-force scan over every node (~900ms at 51k nodes vs ~0.6ms,
+        # measured on a 51k-node graph with 1024-dim embeddings).
+        # So node filters ride a standard pre-RETURN WHERE (verified to keep the
+        # ANN scan) and min_score is applied client-side on the ranked top-k.
+        # That trim is equivalent to the generic branch's pre-LIMIT
+        # `score > min_score`: the threshold is monotone in the ranking key, so
+        # trimming the top-k by (1 - dist) > min_score yields the same node set.
+        # `dist` is a true cosine distance (matches brute force to ~1e-7), so
+        # (1 - dist) is the cosine similarity. The query vector rides a bound
+        # $search_vector rather than an inlined literal: inlining makes every
+        # query's text unique, so NeuG re-parses and re-plans each one, and
+        # that compilation is 92.4% of the query's latency (20k-node 1024-dim
+        # HNSW table: 30.7ms for a first-seen literal vs 2.35ms for a repeated
+        # one, vs 2.4-3.4ms bound; identical top-k, and the bound form still
+        # gets the ANN IndexScan rewrite). numpy-backed float lists are coerced
+        # to Python floats by the driver's _sanitize_params, so callers can
+        # pass list(np.ndarray) straight through.
+        query = (
+            """
+            MATCH (n:Entity)
+            """
+            + filter_query
+            + """
+            RETURN
+            """
+            + get_entity_node_return_query(driver.provider)
+            + """,
+            vector_distance_cosine(n.name_embedding, $search_vector) AS dist
+            ORDER BY dist ASC LIMIT """
+            + str(int(limit))
+        )
+
+        records, _, _ = await driver.execute_query(
+            query,
+            search_vector=search_vector,
+            routing_='r',
+            **filter_params,
+        )
+
+        nodes = [
+            get_entity_node_from_record(record, driver.provider)
+            for record in records
+            if (1.0 - float(record.get('dist', 0.0))) > min_score
+        ]
+
+        return nodes
 
     if driver.provider == GraphProvider.NEPTUNE:
         query = (
@@ -814,6 +1120,56 @@ async def node_bfs_search(
     if filter_queries:
         filter_query = ' AND ' + (' AND '.join(filter_queries))
 
+    if driver.provider == GraphProvider.NEUG:
+        # No UNWIND and no mixed-type traversal from an unlabelled origin, so
+        # BFS runs as one leg per origin kind; MENTIONS only ever appears as
+        # the first hop out of an Episodic origin.
+        filter_params['bfs_origin_node_uuids'] = bfs_origin_node_uuids
+        match_queries = [
+            f"""
+            MATCH (origin:Entity)-[:RELATES_TO*1..{bfs_max_depth}]->(n:Entity)
+            WHERE origin.uuid IN $bfs_origin_node_uuids
+            AND n.group_id = origin.group_id
+            """,
+        ]
+        if bfs_max_depth == 1:
+            match_queries.append("""
+                MATCH (origin:Episodic)-[:MENTIONS]->(n:Entity)
+                WHERE origin.uuid IN $bfs_origin_node_uuids
+                AND n.group_id = origin.group_id
+            """)
+        else:
+            match_queries.append(f"""
+                MATCH (origin:Episodic)-[:MENTIONS]->(:Entity)-[:RELATES_TO*0..{bfs_max_depth - 1}]->(n:Entity)
+                WHERE origin.uuid IN $bfs_origin_node_uuids
+                AND n.group_id = origin.group_id
+            """)
+
+        records = []
+        seen_uuids: set[str] = set()
+        for match_query in match_queries:
+            sub_records, _, _ = await driver.execute_query(
+                match_query
+                + filter_query
+                + """
+                RETURN
+                """
+                + get_entity_node_return_query(driver.provider)
+                + """
+                LIMIT """
+                + str(int(limit)),
+                routing_='r',
+                **filter_params,
+            )
+            for record in sub_records:
+                if record['uuid'] not in seen_uuids:
+                    seen_uuids.add(record['uuid'])
+                    records.append(record)
+
+        nodes = [get_entity_node_from_record(record, driver.provider) for record in records]
+
+        return nodes
+
     match_queries = [
         f"""
         UNWIND $bfs_origin_node_uuids AS origin_uuid
@@ -900,6 +1256,35 @@ async def episode_fulltext_search(
     if group_ids is not None:
         group_filter_query += '\nAND e.group_id IN $group_ids'
         filter_params['group_ids'] = group_ids
+
+    if driver.provider == GraphProvider.NEUG:
+        # Single weighted multi-property bm25 over the Episodic(content,
+        # source, source_description) FTS index (content weighted 3x). The
+        # group filter rides the PRE-bm25 WHERE, so the top-K is computed
+        # within the group (exact recall). Replaces three per-column queries
+        # merged client-side with the filter applied AFTER ORDER BY/LIMIT.
+        group_filter = ' WHERE e.group_id IN $group_ids' if group_ids is not None else ''
+        records, _, _ = await driver.execute_query(
+            """
+            MATCH (e:Episodic)
+            """
+            + group_filter
+            + """
+            WITH e, bm25([e.content, e.source, e.source_description], [3.0, 1.0, 1.0], $query) AS score
+            ORDER BY score ASC LIMIT """
+            + str(int(limit))
+            + """
+            RETURN
+            """
+            + EPISODIC_NODE_RETURN,
+            query=fuzzy_query,
+            routing_='r',
+            **filter_params,
+        )
+
+        episodes = [get_episodic_node_from_record(record) for record in records]
+
+        return episodes
 
     if driver.provider == GraphProvider.NEPTUNE:
         res = driver.run_aoss_query('episode_content', query, limit=limit)  # pyright: ignore reportAttributeAccessIssue
@@ -989,6 +1374,36 @@ async def community_fulltext_search(
         group_filter_query = 'WHERE c.group_id IN $group_ids'
         filter_params['group_ids'] = group_ids
 
+    if driver.provider == GraphProvider.NEUG:
+        # bm25 over the Community(name) FTS index; the group filter rides the
+        # PRE-bm25 WHERE, so the top-K is computed within the group (exact
+        # recall) instead of AFTER ORDER BY/LIMIT.
+        query = (
+            """
+            MATCH (c:Community)
+            """
+            + group_filter_query
+            + """
+            WITH c, bm25(c.name, $query) AS score
+            ORDER BY score ASC LIMIT """
+            + str(int(limit))
+            + """
+            RETURN
+            """
+            + COMMUNITY_NODE_RETURN
+            + """
+            ORDER BY score ASC
+            """
+        )
+
+        records, _, _ = await driver.execute_query(
+            query, query=fuzzy_query, routing_='r', **filter_params
+        )
+
+        communities = [get_community_node_from_record(record) for record in records]
+
+        return communities
+
     yield_query = 'YIELD node AS c, score'
     if driver.provider == GraphProvider.KUZU:
         yield_query = 'WITH node AS c, score'
@@ -1075,6 +1490,49 @@ async def community_similarity_search(
     if group_ids is not None:
         group_filter_query += ' WHERE c.group_id IN $group_ids'
         query_params['group_ids'] = group_ids
+
+    if driver.provider == GraphProvider.NEUG:
+        # HNSW ANN path, same shape as node_similarity_search: a terminal
+        #   RETURN ..., vector_distance_cosine(c.name_embedding, <lit>) AS dist
+        #   ORDER BY dist ASC LIMIT k
+        # is rewritten into an ANN IndexScan. The group filter rides the
+        # pre-RETURN WHERE (pushed into the scan as a scalar pre-filter, so the
+        # top-K is computed within the group — exact recall), and the extra
+        # `WITH c, dist` projection is gone: it turned dist into a plain
+        # variable reference the rewrite no longer recognizes, degrading to a
+        # brute-force scan. min_score trims the ranked top-K client-side
+        # (monotone in dist). The query vector rides a bound $search_vector;
+        # see node_similarity_search for why inlining it costs ~92% of the
+        # query's latency in plan recompilation.
+        query = (
+            """
+            MATCH (c:Community)
+            """
+            + group_filter_query
+            + """
+            RETURN
+            """
+            + COMMUNITY_NODE_RETURN
+            + """,
+            vector_distance_cosine(c.name_embedding, $search_vector) AS dist
+            ORDER BY dist ASC LIMIT """
+            + str(int(limit))
+        )
+
+        records, _, _ = await driver.execute_query(
+            query,
+            search_vector=search_vector,
+            routing_='r',
+            **query_params,
+        )
+
+        communities = [
+            get_community_node_from_record(record)
+            for record in records
+            if (1.0 - float(record['dist'])) > min_score
+        ]
+
+        return communities
 
     if driver.provider == GraphProvider.NEPTUNE:
         query = (
@@ -1274,6 +1732,37 @@ async def get_relevant_nodes(
     if filter_queries:
         filter_query = 'WHERE ' + (' AND '.join(filter_queries))
 
+    if driver.provider == GraphProvider.NEUG:
+        # NeuG supports neither UNWIND nor nested map params, so each query
+        # node is searched individually: vector candidates plus fulltext
+        # candidates, merged with vector matches taking priority.
+        relevant_nodes: list[list[EntityNode]] = []
+        for node in nodes:
+            if node.name_embedding is None:
+                relevant_nodes.append([])
+                continue
+            vector_nodes = await node_similarity_search(
+                driver,
+                node.name_embedding,
+                search_filter,
+                group_ids=[node.group_id],
+                limit=limit,
+                min_score=min_score,
+            )
+            seen = {candidate.uuid for candidate in vector_nodes}
+            fulltext_nodes = await node_fulltext_search(
+                driver,
+                fulltext_query(node.name, [node.group_id], driver),
+                search_filter,
+                group_ids=[node.group_id],
+                limit=limit,
+            )
+            relevant_nodes.append(
+                vector_nodes
+                + [candidate for candidate in fulltext_nodes if candidate.uuid not in seen]
+            )
+        return relevant_nodes
+
     if driver.provider == GraphProvider.KUZU:
         embedding_size = len(nodes[0].name_embedding) if nodes[0].name_embedding is not None else 0
         if embedding_size == 0:
@@ -1416,6 +1905,52 @@ async def get_relevant_edges(
     filter_query = ''
     if filter_queries:
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
+
+    if driver.provider == GraphProvider.NEUG:
+        # NeuG supports neither UNWIND nor nested map params; search each
+        # query edge individually between its endpoint pair (both directions,
+        # mirroring the undirected match of the other providers).
+        relevant_edges: list[list[EntityEdge]] = []
+        for edge in edges:
+            if edge.fact_embedding is None:
+                relevant_edges.append([])
+                continue
+            matches: dict[str, EntityEdge] = {}
+            for src, dst in (
+                (edge.source_node_uuid, edge.target_node_uuid),
+                (edge.target_node_uuid, edge.source_node_uuid),
+            ):
+                query = (
+                    """
+                    MATCH (n:Entity {uuid: $source_uuid})-[e:RELATES_TO {group_id: $group_id}]->(m:Entity {uuid: $target_uuid})
+                    """
+                    + filter_query
+                    + """
+                    WITH e, n, m, vector_distance_cosine(e.fact_embedding, $search_vector) AS dist
+                    WITH e, n, m, dist
+                    WHERE (1 - dist) > $min_score
+                    RETURN
+                    """
+                    + get_entity_edge_return_query(driver.provider)
+                    + """
+                    ORDER BY dist ASC LIMIT """
+                    + str(int(limit))
+                )
+                records, _, _ = await driver.execute_query(
+                    query,
+                    search_vector=edge.fact_embedding,
+                    source_uuid=src,
+                    target_uuid=dst,
+                    group_id=edge.group_id,
+                    min_score=min_score,
+                    routing_='r',
+                    **filter_params,
+                )
+                for record in records:
+                    parsed = get_entity_edge_from_record(record, driver.provider)
+                    matches.setdefault(parsed.uuid, parsed)
+            relevant_edges.append(list(matches.values()))
+        return relevant_edges
 
     if driver.provider == GraphProvider.NEPTUNE:
         query = (
@@ -1601,6 +2136,44 @@ async def get_edge_invalidation_candidates(
     filter_query = ''
     if filter_queries:
         filter_query = ' AND ' + (' AND '.join(filter_queries))
+
+    if driver.provider == GraphProvider.NEUG:
+        # NeuG supports neither UNWIND nor nested map params; search each
+        # query edge individually.
+        invalidation_candidates: list[list[EntityEdge]] = []
+        for edge in edges:
+            if edge.fact_embedding is None:
+                invalidation_candidates.append([])
+                continue
+            query = (
+                """
+                MATCH (n:Entity)-[e:RELATES_TO {group_id: $group_id}]->(m:Entity)
+                WHERE (n.uuid IN $endpoint_uuids OR m.uuid IN $endpoint_uuids)"""
+                + filter_query
+                + """
+                WITH e, n, m, vector_distance_cosine(e.fact_embedding, $search_vector) AS dist
+                WITH e, n, m, dist
+                WHERE (1 - dist) > $min_score
+                RETURN
+                """
+                + get_entity_edge_return_query(driver.provider)
+                + """
+                ORDER BY dist ASC LIMIT """
+                + str(int(limit))
+            )
+            records, _, _ = await driver.execute_query(
+                query,
+                search_vector=edge.fact_embedding,
+                endpoint_uuids=[edge.source_node_uuid, edge.target_node_uuid],
+                group_id=edge.group_id,
+                min_score=min_score,
+                routing_='r',
+                **filter_params,
+            )
+            invalidation_candidates.append(
+                [get_entity_edge_from_record(record, driver.provider) for record in records]
+            )
+        return invalidation_candidates
 
     if driver.provider == GraphProvider.NEPTUNE:
         query = (
@@ -1820,20 +2393,37 @@ async def node_distance_reranker(
         RETURN 1 AS score, node_uuid AS uuid
         """
 
-    # Find the shortest path to center node
-    results, header, _ = await driver.execute_query(
-        query,
-        node_uuids=filtered_uuids,
-        center_uuid=center_node_uuid,
-        routing_='r',
-    )
-    if driver.provider == GraphProvider.FALKORDB:
-        results = [dict(zip(header, row, strict=True)) for row in results]
+    if driver.provider == GraphProvider.NEUG:
+        # No UNWIND: the candidate list is bound instead; skip the query
+        # entirely when nothing but the center remains.
+        if len(filtered_uuids) > 0:
+            results, _, _ = await driver.execute_query(
+                """
+                MATCH (center:Entity {uuid: $center_uuid})-[:RELATES_TO]-(n:Entity)
+                WHERE n.uuid IN $node_uuids
+                RETURN 1 AS score, n.uuid AS uuid
+                """,
+                node_uuids=filtered_uuids,
+                center_uuid=center_node_uuid,
+                routing_='r',
+            )
+            for result in results:
+                scores[result['uuid']] = result['score']
+    else:
+        # Find the shortest path to center node
+        results, header, _ = await driver.execute_query(
+            query,
+            node_uuids=filtered_uuids,
+            center_uuid=center_node_uuid,
+            routing_='r',
+        )
+        if driver.provider == GraphProvider.FALKORDB:
+            results = [dict(zip(header, row, strict=True)) for row in results]
 
-    for result in results:
-        uuid = result['uuid']
-        score = result['score']
-        scores[uuid] = score
+        for result in results:
+            uuid = result['uuid']
+            score = result['score']
+            scores[uuid] = score
 
     for uuid in filtered_uuids:
         if uuid not in scores:
@@ -1867,19 +2457,34 @@ async def episode_mentions_reranker(
     sorted_uuids, _ = rrf(node_uuids)
     scores: dict[str, float] = {}
 
-    # Find the shortest path to center node
-    results, _, _ = await driver.execute_query(
-        """
-        UNWIND $node_uuids AS node_uuid
-        MATCH (episode:Episodic)-[r:MENTIONS]->(n:Entity {uuid: node_uuid})
-        RETURN count(*) AS score, n.uuid AS uuid
-        """,
-        node_uuids=sorted_uuids,
-        routing_='r',
-    )
+    if driver.provider == GraphProvider.NEUG:
+        # No UNWIND: the candidate list is bound instead.
+        if len(sorted_uuids) > 0:
+            results, _, _ = await driver.execute_query(
+                """
+                MATCH (episode:Episodic)-[r:MENTIONS]->(n:Entity)
+                WHERE n.uuid IN $node_uuids
+                RETURN count(*) AS score, n.uuid AS uuid
+                """,
+                node_uuids=sorted_uuids,
+                routing_='r',
+            )
+            for result in results:
+                scores[result['uuid']] = result['score']
+    else:
+        # Find the shortest path to center node
+        results, _, _ = await driver.execute_query(
+            """
+            UNWIND $node_uuids AS node_uuid
+            MATCH (episode:Episodic)-[r:MENTIONS]->(n:Entity {uuid: node_uuid})
+            RETURN count(*) AS score, n.uuid AS uuid
+            """,
+            node_uuids=sorted_uuids,
+            routing_='r',
+        )
 
-    for result in results:
-        scores[result['uuid']] = result['score']
+        for result in results:
+            scores[result['uuid']] = result['score']
 
     for uuid in sorted_uuids:
         if uuid not in scores:
@@ -1944,7 +2549,11 @@ async def get_embeddings_for_nodes(
 ) -> dict[str, list[float]]:
     if driver.graph_operations_interface:
         return await driver.graph_operations_interface.node_load_embeddings_bulk(driver, nodes)
-    elif driver.provider == GraphProvider.NEPTUNE:
+
+    if len(nodes) == 0:
+        return {}
+
+    if driver.provider == GraphProvider.NEPTUNE:
         query = """
         MATCH (n:Entity)
         WHERE n.uuid IN $node_uuids
@@ -1985,6 +2594,9 @@ async def get_embeddings_for_communities(
         except NotImplementedError:
             pass
 
+    if len(communities) == 0:
+        return {}
+
     if driver.provider == GraphProvider.NEPTUNE:
         query = """
         MATCH (c:Community)
@@ -2022,7 +2634,11 @@ async def get_embeddings_for_edges(
 ) -> dict[str, list[float]]:
     if driver.graph_operations_interface:
         return await driver.graph_operations_interface.edge_load_embeddings_bulk(driver, edges)
-    elif driver.provider == GraphProvider.NEPTUNE:
+
+    if len(edges) == 0:
+        return {}
+
+    if driver.provider == GraphProvider.NEPTUNE:
         query = """
         MATCH (n:Entity)-[e:RELATES_TO]-(m:Entity)
         WHERE e.uuid IN $edge_uuids
@@ -2038,6 +2654,27 @@ async def get_embeddings_for_edges(
             match_query = """
                 MATCH (n:Entity)-[:RELATES_TO]-(e:RelatesToNode_)-[:RELATES_TO]-(m:Entity)
             """
+        elif driver.provider == GraphProvider.NEUG:
+            # Embeddings are read from the EdgeDoc mirror table.
+            query = """
+                MATCH (d:EdgeDoc)
+                WHERE d.uuid IN $edge_uuids
+                RETURN DISTINCT
+                    d.uuid AS uuid,
+                    d.fact_embedding AS fact_embedding
+            """
+            results, _, _ = await driver.execute_query(
+                query, edge_uuids=[edge.uuid for edge in edges], routing_='r'
+            )
+
+            edge_embeddings_dict: dict[str, list[float]] = {}
+            for result in results:
+                edge_uuid = result.get('uuid')
+                edge_embedding = result.get('fact_embedding')
+                if edge_uuid is not None and edge_embedding is not None:
+                    edge_embeddings_dict[edge_uuid] = edge_embedding
+
+            return edge_embeddings_dict
 
         query = (
             match_query

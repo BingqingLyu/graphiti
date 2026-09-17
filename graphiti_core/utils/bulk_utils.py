@@ -178,7 +178,7 @@ async def add_nodes_and_edges_bulk_tx(
             'labels': list(set(node.labels + ['Entity'])),
         }
 
-        if driver.provider == GraphProvider.KUZU:
+        if driver.provider == GraphProvider.KUZU or driver.provider == GraphProvider.NEUG:
             attributes = convert_datetimes_to_strings(node.attributes) if node.attributes else {}
             entity_data['attributes'] = json.dumps(attributes)
         else:
@@ -208,7 +208,7 @@ async def add_nodes_and_edges_bulk_tx(
             'fact_embedding': edge.fact_embedding,
         }
 
-        if driver.provider == GraphProvider.KUZU:
+        if driver.provider == GraphProvider.KUZU or driver.provider == GraphProvider.NEUG:
             attributes = convert_datetimes_to_strings(edge.attributes) if edge.attributes else {}
             edge_data['attributes'] = json.dumps(attributes)
         else:
@@ -244,6 +244,22 @@ async def add_nodes_and_edges_bulk_tx(
         episodic_edge_query = get_episodic_edge_save_bulk_query(driver.provider)
         for edge in episodic_edges:
             await tx.run(episodic_edge_query, **edge.model_dump())
+    elif driver.provider == GraphProvider.NEUG:
+        # NeuG cannot UNWIND bound lists, so the generic per-row MERGE loop
+        # would mean one engine round trip per node/edge. COPY FROM ingests a
+        # whole CSV in a single statement instead (orders of magnitude faster);
+        # only entity nodes already present in the graph keep the MERGE path
+        # so their properties still get refreshed.
+        from graphiti_core.driver.neug.bulk_import import neug_bulk_copy_write
+
+        await neug_bulk_copy_write(
+            driver,
+            episodes,
+            nodes,
+            edges,
+            [edge.model_dump() for edge in episodic_edges],
+            get_entity_node_save_bulk_query(driver.provider, nodes),
+        )
     else:
         await tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes)
         await tx.run(

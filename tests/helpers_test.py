@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+import tempfile
 from unittest.mock import Mock
 
 import numpy as np
@@ -68,6 +69,17 @@ if os.getenv('DISABLE_NEPTUNE') is None:
     except ImportError:
         raise
 
+# NeuG is an embedded database whose Python binding is not published on PyPI
+# (it ships with a local build), so a failed import skips it silently instead
+# of breaking collection on environments without it.
+if os.getenv('DISABLE_NEUG') is None:
+    try:
+        from graphiti_core.driver.neug_driver import NeuGDriver
+
+        drivers.append(GraphProvider.NEUG)
+    except ImportError:
+        pass
+
 NEO4J_URI = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
 NEO4J_USER = os.getenv('NEO4J_USER', 'neo4j')
 NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', 'test')
@@ -112,6 +124,14 @@ def get_driver(provider: GraphProvider) -> GraphDriver:
             port=int(NEPTUNE_PORT),
             aoss_host=AOSS_HOST,
         )
+    elif provider == GraphProvider.NEUG:
+        # Fresh database per fixture invocation: NeuG currently corrupts a
+        # source node's outgoing-edge state after an edge deletion ('invalid
+        # oe offset'), so reusing a persistent DB would poison later tests.
+        return NeuGDriver(
+            db_path=tempfile.mkdtemp(prefix='graphiti_neug_test_'),
+            embedding_dim=embedding_dim,
+        )
     else:
         raise ValueError(f'Driver {provider} not available')
 
@@ -129,7 +149,10 @@ async def graph_driver(request):
         await graph_driver.close()
 
 
-embedding_dim = 384
+# 1024 matches Graphiti's default embedding dimension; some tests (e.g.
+# test_node_int.py) hardcode 1024-dim vectors, and the NeuG driver schema is
+# sized from this constant.
+embedding_dim = 1024
 embeddings = {
     key: np.random.uniform(0.0, 0.9, embedding_dim).tolist()
     for key in [
@@ -210,6 +233,18 @@ async def get_node_count(driver: GraphDriver, uuids: list[str]) -> int:
 
 
 async def get_edge_count(driver: GraphDriver, uuids: list[str]) -> int:
+    if driver.provider == GraphProvider.NEUG:
+        # There are no RelatesToNode_ mirror nodes on NeuG, so counting real
+        # edges is sufficient.
+        results, _, _ = await driver.execute_query(
+            """
+            MATCH ()-[e]->()
+            WHERE e.uuid IN $uuids
+            RETURN count(e) AS count
+            """,
+            uuids=uuids,
+        )
+        return int(results[0]['count'])
     results, _, _ = await driver.execute_query(
         """
         MATCH (n)-[e]->(m)
@@ -267,6 +302,19 @@ async def assert_episodic_node_equals(retrieved: EpisodicNode, sample: EpisodicN
     assert set(retrieved.entity_edges) == set(sample.entity_edges)
 
 
+def _assert_embedding_equals(graph_driver: GraphDriver, retrieved, sample):
+    if graph_driver.provider == GraphProvider.NEUG:
+        # NeuG stores L2-normalized vectors for cosine HNSW: the driver
+        # pre-normalizes embeddings before writing (and indexes use
+        # cosine_normalize = false), so compare directions, not raw values.
+        assert np.allclose(
+            np.asarray(retrieved) / np.linalg.norm(retrieved),
+            np.asarray(sample) / np.linalg.norm(sample),
+        )
+    else:
+        assert np.allclose(retrieved, sample)
+
+
 async def assert_entity_node_equals(
     graph_driver: GraphDriver, retrieved: EntityNode, sample: EntityNode
 ):
@@ -278,7 +326,7 @@ async def assert_entity_node_equals(
     assert_datetimes_equal(retrieved.created_at, sample.created_at)
     assert retrieved.name_embedding is not None
     assert sample.name_embedding is not None
-    assert np.allclose(retrieved.name_embedding, sample.name_embedding)
+    _assert_embedding_equals(graph_driver, retrieved.name_embedding, sample.name_embedding)
     assert retrieved.summary == sample.summary
     assert retrieved.attributes == sample.attributes
 
@@ -293,7 +341,7 @@ async def assert_community_node_equals(
     assert_datetimes_equal(retrieved.created_at, sample.created_at)
     assert retrieved.name_embedding is not None
     assert sample.name_embedding is not None
-    assert np.allclose(retrieved.name_embedding, sample.name_embedding)
+    _assert_embedding_equals(graph_driver, retrieved.name_embedding, sample.name_embedding)
     assert retrieved.summary == sample.summary
 
 
@@ -318,7 +366,7 @@ async def assert_entity_edge_equals(
     assert retrieved.fact == sample.fact
     assert retrieved.fact_embedding is not None
     assert sample.fact_embedding is not None
-    assert np.allclose(retrieved.fact_embedding, sample.fact_embedding)
+    _assert_embedding_equals(graph_driver, retrieved.fact_embedding, sample.fact_embedding)
     assert retrieved.episodes == sample.episodes
     assert_datetimes_equal(retrieved.expired_at, sample.expired_at)
     assert_datetimes_equal(retrieved.valid_at, sample.valid_at)

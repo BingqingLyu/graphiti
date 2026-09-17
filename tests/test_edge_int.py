@@ -18,12 +18,17 @@ import logging
 import sys
 from datetime import datetime
 
-import numpy as np
 import pytest
 
 from graphiti_core.edges import CommunityEdge, EntityEdge, EpisodicEdge
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
-from tests.helpers_test import assert_datetimes_equal, get_edge_count, get_node_count, group_id
+from tests.helpers_test import (
+    _assert_embedding_equals,
+    assert_datetimes_equal,
+    get_edge_count,
+    get_node_count,
+    group_id,
+)
 
 pytest_plugins = ('pytest_asyncio',)
 
@@ -251,7 +256,7 @@ async def test_entity_edge(graph_driver, mock_embedder):
 
     # Get fact embedding
     await entity_edge.load_fact_embedding(graph_driver)
-    assert np.allclose(entity_edge.fact_embedding, edge_embedding)
+    _assert_embedding_equals(graph_driver, entity_edge.fact_embedding, edge_embedding)
 
     # Delete edge by uuid
     await entity_edge.delete(graph_driver)

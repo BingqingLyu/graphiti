@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from typing_extensions import LiteralString
 
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
+from graphiti_core.driver.neug.dialect import esc
 from graphiti_core.edges import (
     CommunityEdge,
     EntityEdge,
@@ -857,7 +858,28 @@ async def filter_existing_duplicate_of_edges(
         (source.uuid, target.uuid): (source, target) for source, target in duplicates_node_tuples
     }
 
-    if driver.provider == GraphProvider.NEPTUNE:
+    if driver.provider == GraphProvider.NEUG:
+        # UNWIND and bound list params are unusable on NeuG; inline the pairs.
+        pair_conditions = ' OR '.join(
+            f'(n.uuid = {esc(src)} AND m.uuid = {esc(dst)})' for src, dst in duplicate_nodes_map
+        )
+        neug_query = (
+            """
+            MATCH (n:Entity)-[r:RELATES_TO {name: 'IS_DUPLICATE_OF'}]->(m:Entity)
+            WHERE """
+            + pair_conditions
+            + """
+            RETURN DISTINCT
+                n.uuid AS source_uuid,
+                m.uuid AS target_uuid
+            """
+        )
+
+        records, _, _ = await driver.execute_query(
+            neug_query,
+            routing_='r',
+        )
+    elif driver.provider == GraphProvider.NEPTUNE:
         query: LiteralString = """
             UNWIND $duplicate_node_uuids AS duplicate_tuple
             MATCH (n:Entity {uuid: duplicate_tuple.source})-[r:RELATES_TO {name: 'IS_DUPLICATE_OF'}]->(m:Entity {uuid: duplicate_tuple.target})

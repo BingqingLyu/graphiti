@@ -28,7 +28,7 @@ EPISODIC_EDGE_SAVE = """
 
 
 def get_episodic_edge_save_bulk_query(provider: GraphProvider) -> str:
-    if provider == GraphProvider.KUZU:
+    if provider == GraphProvider.KUZU or provider == GraphProvider.NEUG:
         return """
             MATCH (episode:Episodic {uuid: $source_node_uuid})
             MATCH (node:Entity {uuid: $target_node_uuid})
@@ -86,6 +86,25 @@ def get_entity_edge_save_query(provider: GraphProvider, has_aoss: bool = False) 
                 MATCH (source:Entity {uuid: $source_uuid})
                 MATCH (target:Entity {uuid: $target_uuid})
                 MERGE (source)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: $uuid})-[:RELATES_TO]->(target)
+                SET
+                    e.group_id = $group_id,
+                    e.created_at = $created_at,
+                    e.name = $name,
+                    e.fact = $fact,
+                    e.fact_embedding = $fact_embedding,
+                    e.episodes = $episodes,
+                    e.expired_at = $expired_at,
+                    e.valid_at = $valid_at,
+                    e.invalid_at = $invalid_at,
+                    e.reference_time = $reference_time,
+                    e.attributes = $attributes
+                RETURN e.uuid AS uuid
+            """
+        case GraphProvider.NEUG:
+            return """
+                MATCH (source:Entity {uuid: $source_uuid})
+                MATCH (target:Entity {uuid: $target_uuid})
+                MERGE (source)-[e:RELATES_TO {uuid: $uuid}]->(target)
                 SET
                     e.group_id = $group_id,
                     e.created_at = $created_at,
@@ -165,6 +184,25 @@ def get_entity_edge_save_bulk_query(provider: GraphProvider, has_aoss: bool = Fa
                     e.attributes = $attributes
                 RETURN e.uuid AS uuid
             """
+        case GraphProvider.NEUG:
+            return """
+                MATCH (source:Entity {uuid: $source_node_uuid})
+                MATCH (target:Entity {uuid: $target_node_uuid})
+                MERGE (source)-[e:RELATES_TO {uuid: $uuid}]->(target)
+                SET
+                    e.group_id = $group_id,
+                    e.created_at = $created_at,
+                    e.name = $name,
+                    e.fact = $fact,
+                    e.fact_embedding = $fact_embedding,
+                    e.episodes = $episodes,
+                    e.expired_at = $expired_at,
+                    e.valid_at = $valid_at,
+                    e.invalid_at = $invalid_at,
+                    e.reference_time = $reference_time,
+                    e.attributes = $attributes
+                RETURN e.uuid AS uuid
+            """
         case _:
             save_embedding_query = (
                 'WITH e, edge CALL db.create.setRelationshipVectorProperty(e, "fact_embedding", edge.fact_embedding)'
@@ -195,8 +233,13 @@ def get_entity_edge_return_query(provider: GraphProvider) -> str:
     # edges, so `e` is a node, not a relationship, and `startNode`/`endNode` are not applicable.
     # KUZU's MATCH is always directed `(n)-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(m)`,
     # so `n`/`m` already reflect the true source/target.
+    # NEUG has real relationships; its endpoint functions are START_NODE()/
+    # END_NODE(), but undirected matches still bind pattern variables by
+    # match order, so it follows the same convention: surrounding queries
+    # must bind n to the source and m to the target (directed MATCH, or an
+    # undirected match with START_NODE(e)/END_NODE(e) rebound via WITH).
 
-    if provider == GraphProvider.KUZU:
+    if provider == GraphProvider.KUZU or provider == GraphProvider.NEUG:
         return """
         e.uuid AS uuid,
         n.uuid AS source_node_uuid,
@@ -247,6 +290,33 @@ def get_entity_edge_return_query(provider: GraphProvider) -> str:
     """
 
 
+def get_entity_edge_doc_return_query() -> str:
+    """NEUG: return every edge field straight from the EdgeDoc mirror (alias d).
+
+    EdgeDoc carries the full edge property set plus source_node_uuid /
+    target_node_uuid, so a vector/FTS ranking over the mirror can project the
+    result directly and skip the join back to RELATES_TO. Dropping that join is
+    what lets the engine keep the HNSW/FTS IndexScan (a join after ORDER BY /
+    LIMIT forces a brute-force re-rank). Column aliases match
+    get_entity_edge_return_query, so get_entity_edge_from_record parses either.
+    """
+    return """
+        d.uuid AS uuid,
+        d.source_node_uuid AS source_node_uuid,
+        d.target_node_uuid AS target_node_uuid,
+        d.group_id AS group_id,
+        d.created_at AS created_at,
+        d.name AS name,
+        d.fact AS fact,
+        d.episodes AS episodes,
+        d.expired_at AS expired_at,
+        d.valid_at AS valid_at,
+        d.invalid_at AS invalid_at,
+        d.reference_time AS reference_time,
+        d.attributes AS attributes
+    """
+
+
 def get_community_edge_save_query(provider: GraphProvider) -> str:
     match provider:
         case GraphProvider.FALKORDB:
@@ -267,6 +337,28 @@ def get_community_edge_save_query(provider: GraphProvider) -> str:
                 SET r.group_id= $group_id
                 SET r.created_at= $created_at
                 RETURN r.uuid AS uuid
+            """
+        case GraphProvider.NEUG:
+            # NeuG rejects UNION (dedup) and UNION ALL projects empty values
+            # on write queries — but the MERGE side effects of every branch
+            # still execute, and no caller consumes the result rows, so UNION
+            # ALL is the working way to cover both target labels here.
+            return """
+                MATCH (community:Community {uuid: $community_uuid})
+                MATCH (node:Entity {uuid: $entity_uuid})
+                MERGE (community)-[e:HAS_MEMBER {uuid: $uuid}]->(node)
+                SET
+                    e.group_id = $group_id,
+                    e.created_at = $created_at
+                RETURN e.uuid AS uuid
+                UNION ALL
+                MATCH (community:Community {uuid: $community_uuid})
+                MATCH (node:Community {uuid: $entity_uuid})
+                MERGE (community)-[e:HAS_MEMBER {uuid: $uuid}]->(node)
+                SET
+                    e.group_id = $group_id,
+                    e.created_at = $created_at
+                RETURN e.uuid AS uuid
             """
         case GraphProvider.KUZU:
             return """

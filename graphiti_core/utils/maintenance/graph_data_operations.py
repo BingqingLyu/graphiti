@@ -17,8 +17,6 @@ limitations under the License.
 import logging
 from datetime import datetime
 
-from typing_extensions import LiteralString
-
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.models.nodes.node_db_queries import (
     EPISODIC_NODE_RETURN,
@@ -47,6 +45,10 @@ async def clear_data(driver: GraphDriver, group_ids: list[str] | None = None):
             labels = ['Entity', 'Episodic', 'Community', 'Saga']
             if driver.provider == GraphProvider.KUZU:
                 labels.append('RelatesToNode_')
+            if driver.provider == GraphProvider.NEUG:
+                # EdgeDoc mirrors carry edge data as a node table. Saga is
+                # already in the base list (upstream #1688).
+                labels.append('EdgeDoc')
 
             for label in labels:
                 await tx.run(
@@ -113,10 +115,18 @@ async def retrieve_episodes(
                 if driver.provider == GraphProvider.NEPTUNE
                 else EPISODIC_NODE_RETURN
             )
-            + """
+            + (
+                # NeuG only accepts literal LIMITs.
+                f"""
+            ORDER BY e.valid_at DESC
+            LIMIT {int(last_n)}
+            """
+                if driver.provider == GraphProvider.NEUG
+                else """
             ORDER BY e.valid_at DESC
             LIMIT $num_episodes
-            """,
+            """
+            ),
             saga_name=saga,
             group_id=group_id,
             reference_time=reference_time,
@@ -137,7 +147,10 @@ async def retrieve_episodes(
         query_filter += '\nAND e.source = $source'
         query_params['source'] = source.name
 
-    query: LiteralString = (
+    limit_clause = (
+        f'LIMIT {int(last_n)}' if driver.provider == GraphProvider.NEUG else 'LIMIT $num_episodes'
+    )
+    query = (
         """
                                     MATCH (e:Episodic)
                                     WHERE e.valid_at <= $reference_time
@@ -151,9 +164,9 @@ async def retrieve_episodes(
             if driver.provider == GraphProvider.NEPTUNE
             else EPISODIC_NODE_RETURN
         )
-        + """
+        + f"""
         ORDER BY e.valid_at DESC
-        LIMIT $num_episodes
+        {limit_clause}
         """
     )
     result, _, _ = await driver.execute_query(

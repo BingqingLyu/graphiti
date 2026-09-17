@@ -30,6 +30,7 @@ from graphiti_core.driver.driver import (
     GraphDriver,
     GraphProvider,
 )
+from graphiti_core.driver.neug.dialect import neug_limit
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import NodeNotFoundError
 from graphiti_core.helpers import parse_db_date, validate_node_labels
@@ -154,6 +155,31 @@ class Node(BaseModel, ABC):
                     """,
                     uuid=self.uuid,
                 )
+            case GraphProvider.NEUG:
+                # RELATES_TO edges carry EdgeDoc mirrors; drop them before the
+                # nodes (and their edges) disappear. WITH DISTINCT
+                # de-duplicates the edge uuids, which an undirected match binds
+                # twice, once per direction (measured: 2 edges -> 4 rows).
+                # Originally a workaround for neug#965, deletes fed by an
+                # undirected edge match; 0.2.0 fixed that, and the projection is
+                # kept for the de-duplication.
+                await driver.execute_query(
+                    """
+                    MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity)
+                    WITH DISTINCT e.uuid AS eu
+                    MATCH (d:EdgeDoc {uuid: eu})
+                    DETACH DELETE d
+                    """,
+                    uuid=self.uuid,
+                )
+                for label in ['Entity', 'Episodic', 'Community', 'Saga']:
+                    await driver.execute_query(
+                        f"""
+                        MATCH (n:{label} {{uuid: $uuid}})
+                        DETACH DELETE n
+                        """,
+                        uuid=self.uuid,
+                    )
             case _:  # FalkorDB, Neptune
                 for label in ['Entity', 'Episodic', 'Community']:
                     await driver.execute_query(
@@ -223,6 +249,29 @@ class Node(BaseModel, ABC):
                     """,
                     group_id=group_id,
                 )
+            case GraphProvider.NEUG:
+                # RELATES_TO edges carry EdgeDoc mirrors; drop them first.
+                # WITH DISTINCT de-duplicates the edge uuids, which an
+                # undirected match binds twice, once per direction. Originally a
+                # workaround for neug#965 (deletes fed by an undirected edge
+                # match), which 0.2.0 fixed; kept for the de-duplication.
+                await driver.execute_query(
+                    """
+                    MATCH (n:Entity {group_id: $group_id})-[e:RELATES_TO]-(m:Entity)
+                    WITH DISTINCT e.uuid AS eu
+                    MATCH (d:EdgeDoc {uuid: eu})
+                    DETACH DELETE d
+                    """,
+                    group_id=group_id,
+                )
+                for label in ['Entity', 'Episodic', 'Community', 'Saga']:
+                    await driver.execute_query(
+                        f"""
+                        MATCH (n:{label} {{group_id: $group_id}})
+                        DETACH DELETE n
+                        """,
+                        group_id=group_id,
+                    )
             case _:  # FalkorDB, Neptune
                 for label in ['Entity', 'Episodic', 'Community']:
                     await driver.execute_query(
@@ -282,6 +331,33 @@ class Node(BaseModel, ABC):
                     """,
                     uuids=uuids,
                 )
+            case GraphProvider.NEUG:
+                if not uuids:
+                    return
+                # RELATES_TO edges carry EdgeDoc mirrors; drop them first.
+                # WITH DISTINCT de-duplicates the edge uuids, which an
+                # undirected match binds twice, once per direction. Originally a
+                # workaround for neug#965 (deletes fed by an undirected edge
+                # match), which 0.2.0 fixed; kept for the de-duplication.
+                await driver.execute_query(
+                    """
+                    MATCH (n:Entity)-[e:RELATES_TO]-(m:Entity)
+                    WHERE n.uuid IN $uuids
+                    WITH DISTINCT e.uuid AS eu
+                    MATCH (d:EdgeDoc {uuid: eu})
+                    DETACH DELETE d
+                    """,
+                    uuids=uuids,
+                )
+                for label in ['Entity', 'Episodic', 'Community', 'Saga']:
+                    await driver.execute_query(
+                        f"""
+                        MATCH (n:{label})
+                        WHERE n.uuid IN $uuids
+                        DETACH DELETE n
+                        """,
+                        uuids=uuids,
+                    )
             case _:  # Neo4J, Neptune
                 async with driver.session() as session:
                     # Collect all edge UUIDs before deleting nodes
@@ -399,10 +475,14 @@ class EpisodicNode(Node):
             except NotImplementedError:
                 pass
 
+        uuids_filter = 'e.uuid IN $uuids'
+
         records, _, _ = await driver.execute_query(
             """
             MATCH (e:Episodic)
-            WHERE e.uuid IN $uuids
+            WHERE """
+            + uuids_filter
+            + """
             RETURN DISTINCT
             """
             + (
@@ -434,14 +514,21 @@ class EpisodicNode(Node):
             except NotImplementedError:
                 pass
 
-        cursor_query: LiteralString = 'AND e.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+        cursor_query = 'AND e.uuid < $uuid' if uuid_cursor else ''
+        group_ids_filter = 'e.group_id IN $group_ids'
+        # NeuG only accepts literal LIMITs.
+        limit_query = (
+            neug_limit(limit)
+            if driver.provider == GraphProvider.NEUG
+            else ('LIMIT $limit' if limit is not None else '')
+        )
 
         records, _, _ = await driver.execute_query(
             """
             MATCH (e:Episodic)
-            WHERE e.group_id IN $group_ids
-            """
+            WHERE """
+            + group_ids_filter
+            + '\n'
             + cursor_query
             + """
             RETURN DISTINCT
@@ -559,7 +646,10 @@ class EntityNode(Node):
             'created_at': self.created_at,
         }
 
-        if driver.provider == GraphProvider.KUZU:
+        if driver.provider in (GraphProvider.KUZU, GraphProvider.NEUG):
+            # NEUG/KUZU save queries bind flat $params (nested map binding is
+            # unsupported on NeuG); attributes are JSON-serialized into their
+            # STRING column and labels land in the STRING[] column.
             entity_data['attributes'] = json.dumps(self.attributes)
             entity_data['labels'] = list(set(self.labels + ['Entity']))
             result = await driver.execute_query(
@@ -616,10 +706,14 @@ class EntityNode(Node):
             except NotImplementedError:
                 pass
 
+        uuids_filter = 'n.uuid IN $uuids'
+
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Entity)
-            WHERE n.uuid IN $uuids
+            WHERE """
+            + uuids_filter
+            + """
             RETURN
             """
             + get_entity_node_return_query(driver.provider),
@@ -648,8 +742,14 @@ class EntityNode(Node):
             except NotImplementedError:
                 pass
 
-        cursor_query: LiteralString = 'AND n.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+        cursor_query = 'AND n.uuid < $uuid' if uuid_cursor else ''
+        group_ids_filter = 'n.group_id IN $group_ids'
+        # NeuG only accepts literal LIMITs.
+        limit_query = (
+            neug_limit(limit)
+            if driver.provider == GraphProvider.NEUG
+            else ('LIMIT $limit' if limit is not None else '')
+        )
         with_embeddings_query: LiteralString = (
             """,
             n.name_embedding AS name_embedding
@@ -661,8 +761,9 @@ class EntityNode(Node):
         records, _, _ = await driver.execute_query(
             """
             MATCH (n:Entity)
-            WHERE n.group_id IN $group_ids
-            """
+            WHERE """
+            + group_ids_filter
+            + '\n'
             + cursor_query
             + """
             RETURN
@@ -797,10 +898,14 @@ class CommunityNode(Node):
             except NotImplementedError:
                 pass
 
+        uuids_filter = 'c.uuid IN $uuids'
+
         records, _, _ = await driver.execute_query(
             """
             MATCH (c:Community)
-            WHERE c.uuid IN $uuids
+            WHERE """
+            + uuids_filter
+            + """
             RETURN
             """
             + (
@@ -832,14 +937,21 @@ class CommunityNode(Node):
             except NotImplementedError:
                 pass
 
-        cursor_query: LiteralString = 'AND c.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+        cursor_query = 'AND c.uuid < $uuid' if uuid_cursor else ''
+        group_ids_filter = 'c.group_id IN $group_ids'
+        # NeuG only accepts literal LIMITs.
+        limit_query = (
+            neug_limit(limit)
+            if driver.provider == GraphProvider.NEUG
+            else ('LIMIT $limit' if limit is not None else '')
+        )
 
         records, _, _ = await driver.execute_query(
             """
             MATCH (c:Community)
-            WHERE c.group_id IN $group_ids
-            """
+            WHERE """
+            + group_ids_filter
+            + '\n'
             + cursor_query
             + """
             RETURN
@@ -957,10 +1069,14 @@ class SagaNode(Node):
             except NotImplementedError:
                 pass
 
+        uuids_filter = 's.uuid IN $uuids'
+
         records, _, _ = await driver.execute_query(
             """
             MATCH (s:Saga)
-            WHERE s.uuid IN $uuids
+            WHERE """
+            + uuids_filter
+            + """
             RETURN
             """
             + (
@@ -992,14 +1108,21 @@ class SagaNode(Node):
             except NotImplementedError:
                 pass
 
-        cursor_query: LiteralString = 'AND s.uuid < $uuid' if uuid_cursor else ''
-        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+        cursor_query = 'AND s.uuid < $uuid' if uuid_cursor else ''
+        group_ids_filter = 's.group_id IN $group_ids'
+        # NeuG only accepts literal LIMITs.
+        limit_query = (
+            neug_limit(limit)
+            if driver.provider == GraphProvider.NEUG
+            else ('LIMIT $limit' if limit is not None else '')
+        )
 
         records, _, _ = await driver.execute_query(
             """
             MATCH (s:Saga)
-            WHERE s.group_id IN $group_ids
-            """
+            WHERE """
+            + group_ids_filter
+            + '\n'
             + cursor_query
             + """
             RETURN
@@ -1048,7 +1171,8 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
 
 
 def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityNode:
-    if provider == GraphProvider.KUZU:
+    if provider in (GraphProvider.KUZU, GraphProvider.NEUG):
+        # attributes are stored JSON-serialized in a STRING column
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
     else:
         attributes = record['attributes']

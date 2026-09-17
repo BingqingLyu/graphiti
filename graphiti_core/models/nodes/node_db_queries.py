@@ -36,7 +36,7 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
                 entity_edges: join([x IN coalesce($entity_edges, []) | toString(x) ], '|'), created_at: $created_at, valid_at: $valid_at}
                 RETURN n.uuid AS uuid
             """
-        case GraphProvider.KUZU:
+        case GraphProvider.KUZU | GraphProvider.NEUG:
             return """
                 MERGE (n:Episodic {uuid: $uuid})
                 SET
@@ -77,7 +77,7 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
                 entity_edges: join([x IN coalesce(episode.entity_edges, []) | toString(x) ], '|'), created_at: episode.created_at, valid_at: episode.valid_at}
                 RETURN n.uuid AS uuid
             """
-        case GraphProvider.KUZU:
+        case GraphProvider.KUZU | GraphProvider.NEUG:
             return """
                 MERGE (n:Episodic {uuid: $uuid})
                 SET
@@ -161,6 +161,19 @@ def get_entity_node_save_query(provider: GraphProvider, labels: str, has_aoss: b
                 WITH n
                 RETURN n.uuid AS uuid
             """
+        case GraphProvider.NEUG:
+            return """
+                MERGE (n:Entity {uuid: $uuid})
+                SET
+                    n.name = $name,
+                    n.group_id = $group_id,
+                    n.labels = $labels,
+                    n.created_at = $created_at,
+                    n.name_embedding = $name_embedding,
+                    n.summary = $summary,
+                    n.attributes = $attributes
+                RETURN n.uuid AS uuid
+            """
         case GraphProvider.NEPTUNE:
             label_subquery = ''
             for label in validated_labels:
@@ -238,7 +251,7 @@ def get_entity_node_save_bulk_query(
                     """
                 )
             return queries
-        case GraphProvider.KUZU:
+        case GraphProvider.KUZU | GraphProvider.NEUG:
             return """
                 MERGE (n:Entity {uuid: $uuid})
                 SET
@@ -273,7 +286,7 @@ def get_entity_node_save_bulk_query(
 
 def get_entity_node_return_query(provider: GraphProvider) -> str:
     # `name_embedding` is not returned by default and must be loaded manually using `load_name_embedding()`.
-    if provider == GraphProvider.KUZU:
+    if provider == GraphProvider.KUZU or provider == GraphProvider.NEUG:
         return """
             n.uuid AS uuid,
             n.name AS name,
@@ -310,7 +323,7 @@ def get_community_node_save_query(provider: GraphProvider) -> str:
                 SET n.name_embedding = join([x IN coalesce($name_embedding, []) | toString(x) ], ",")
                 RETURN n.uuid AS uuid
             """
-        case GraphProvider.KUZU:
+        case GraphProvider.KUZU | GraphProvider.NEUG:
             return """
                 MERGE (n:Community {uuid: $uuid})
                 SET
@@ -351,7 +364,7 @@ COMMUNITY_NODE_RETURN_NEPTUNE = """
 
 def get_saga_node_save_query(provider: GraphProvider) -> str:
     match provider:
-        case GraphProvider.KUZU:
+        case GraphProvider.KUZU | GraphProvider.NEUG:
             return """
                 MERGE (n:Saga {uuid: $uuid})
                 SET

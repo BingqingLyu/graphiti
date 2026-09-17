@@ -56,6 +56,7 @@ from graphiti_core.utils.maintenance.community_operations import (
 from graphiti_core.utils.maintenance.edge_operations import filter_existing_duplicate_of_edges
 from tests.helpers_test import (
     GraphProvider,
+    _assert_embedding_equals,
     assert_entity_edge_equals,
     assert_entity_node_equals,
     assert_episodic_edge_equals,
@@ -2023,7 +2024,9 @@ async def test_get_embeddings_for_edges(graph_driver, mock_embedder):
     embeddings = await get_embeddings_for_edges(graph_driver, [entity_edge_1])
     assert len(embeddings) == 1
     assert entity_edge_1.uuid in embeddings
-    assert np.allclose(embeddings[entity_edge_1.uuid], entity_edge_1.fact_embedding)
+    _assert_embedding_equals(
+        graph_driver, embeddings[entity_edge_1.uuid], entity_edge_1.fact_embedding
+    )
 
 
 @pytest.mark.asyncio
@@ -2044,7 +2047,9 @@ async def test_get_embeddings_for_nodes(graph_driver, mock_embedder):
     embeddings = await get_embeddings_for_nodes(graph_driver, [entity_node_1])
     assert len(embeddings) == 1
     assert entity_node_1.uuid in embeddings
-    assert np.allclose(embeddings[entity_node_1.uuid], entity_node_1.name_embedding)
+    _assert_embedding_equals(
+        graph_driver, embeddings[entity_node_1.uuid], entity_node_1.name_embedding
+    )
 
 
 @pytest.mark.asyncio
@@ -2065,4 +2070,6 @@ async def test_get_embeddings_for_communities(graph_driver, mock_embedder):
     embeddings = await get_embeddings_for_communities(graph_driver, [community_node_1])
     assert len(embeddings) == 1
     assert community_node_1.uuid in embeddings
-    assert np.allclose(embeddings[community_node_1.uuid], community_node_1.name_embedding)
+    _assert_embedding_equals(
+        graph_driver, embeddings[community_node_1.uuid], community_node_1.name_embedding
+    )
